@@ -1,0 +1,14 @@
+
+# Downloaded datasets — keep local, don't push to GitHub
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables and secrets
+.env

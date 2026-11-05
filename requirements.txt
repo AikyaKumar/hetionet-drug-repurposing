@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+scikit-learn
+tabulate
+pytest
+# stage 2 only (GNN):
+# torch
+# torch_geometric
