@@ -1,4 +1,4 @@
-"""STAGE 2 (optional): heterogeneous GraphSAGE link predictor with PyTorch Geometric.
+"""STAGE 2: heterogeneous GraphSAGE link predictor with PyTorch Geometric.
 
 !! Not executed in the environment where this repo was written (torch / PyG were not available there).
 !! Run it first with --epochs 5 --hidden 16 to check shapes, then scale up. Everything it shares with
@@ -8,6 +8,12 @@ python -m hetrepurpose.gnn_pyg --data-dir data --seeds 3 --epochs 200 --hidden 6
 
 Leakage control: the message-passing graph is built WITHOUT the validation/test Compound-treats-Disease
 edges (and their reverse edges), exactly like the metapath features in stage 1.
+
+Negative sampling: each training positive (c, d) is paired with a random disease d' to form a negative
+(c, d'). Pairs that are known positives in the TRAINING data (training treats edges) or palliates (CpD)
+are never used as negatives; they are re-drawn. Validation/test positives are deliberately NOT blocked
+(blocking them would leak held-out labels). The remaining negatives are unlabeled pairs, not confirmed
+non-treatments, so a small fraction of them may be undiscovered true treatments.
 """
 import argparse
 import re
@@ -60,6 +66,27 @@ class Net(torch.nn.Module):
         return self.enc(x, data.edge_index_dict)
 
 
+def build_blocked(g, c_train, d_train, shape, device):
+    """Boolean (nCompound, nDisease) matrix of pairs that must never be used as negatives:
+    TRAINING treats pairs + palliates (CpD). Validation/test positives are intentionally not included."""
+    blocked = pair_matrix(shape, c_train, d_train) | cpd_matrix(g, shape)
+    return torch.as_tensor(blocked, dtype=torch.bool, device=device)
+
+
+def sample_negative_diseases(pc, blocked, n_diseases, max_rounds=100):
+    """For each training compound in `pc`, draw a random disease such that (compound, disease) is not blocked.
+    Rejected draws are re-drawn (rejections are rare: about 1% of all pairs are blocked)."""
+    nd = torch.randint(0, n_diseases, (len(pc),), device=pc.device)
+    for _ in range(max_rounds):
+        bad = blocked[pc, nd]
+        if not bad.any():
+            return nd
+        nd[bad] = torch.randint(0, n_diseases, (int(bad.sum()),), device=pc.device)
+    if blocked[pc, nd].any():
+        raise RuntimeError("could not sample eligible negative diseases; a compound may have every disease blocked")
+    return nd
+
+
 def run_seed(g, seed, epochs, hidden, lr, device):
     torch.manual_seed(seed); np.random.seed(seed)
     nC, nD = g.n("Compound"), g.n("Disease")
@@ -67,6 +94,7 @@ def run_seed(g, seed, epochs, hidden, lr, device):
     known = pair_matrix((nC, nD), c_all, d_all) | cpd_matrix(g, (nC, nD))
     tr, va, te = split_edges(len(c_all), seed)
     keep = np.zeros(len(c_all), dtype=bool); keep[tr] = True
+    blocked = build_blocked(g, c_all[tr], d_all[tr], (nC, nD), device)   # training positives + palliates only
     data = build_data(g, keep).to(device)
     model = Net(data, hidden).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -78,7 +106,7 @@ def run_seed(g, seed, epochs, hidden, lr, device):
         z = model(data)
         zc, zd = z["Compound"], z["Disease"]
         pos = (zc[pc] * zd[pd_]).sum(-1)
-        neg = (zc[pc] * zd[torch.randint(0, nD, (len(pc),), device=device)]).sum(-1)   # corrupt the disease
+        neg = (zc[pc] * zd[sample_negative_diseases(pc, blocked, nD)]).sum(-1)   # corrupt the disease; skip known pairs
         loss = Fn.binary_cross_entropy_with_logits(torch.cat([pos, neg]), torch.cat([torch.ones_like(pos), torch.zeros_like(neg)]))
         loss.backward(); opt.step()
         if epoch % 10 == 0 or epoch == epochs:
